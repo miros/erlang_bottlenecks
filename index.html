@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+  <meta name="viewport" content="width=1024, user-scalable=no">
+
+  <title>Erlang bottlenecks</title>
+
+  <!-- Required stylesheet -->
+  <link rel="stylesheet" media="screen" href="core/deck.core.css">
+
+  <!-- Extension CSS files go here. Remove or add as needed. -->
+  <link rel="stylesheet" media="screen" href="extensions/goto/deck.goto.css">
+  <link rel="stylesheet" media="screen" href="extensions/menu/deck.menu.css">
+  <link rel="stylesheet" media="screen" href="extensions/navigation/deck.navigation.css">
+  <link rel="stylesheet" media="screen" href="extensions/status/deck.status.css">
+  <link rel="stylesheet" media="screen" href="extensions/scale/deck.scale.css">
+
+  <!-- Style theme. More available in /themes/style/ or create your own. -->
+  <link rel="stylesheet" media="screen" href="themes/style/web-2.0.css">
+
+  <!-- Transition theme. More available in /themes/transition/ or create your own. -->
+  <link rel="stylesheet" media="screen" href="themes/transition/horizontal-slide.css">
+
+  <!-- Basic black and white print styles -->
+  <link rel="stylesheet" media="print" href="core/print.css">
+
+  <!-- Required Modernizr file -->
+  <script src="modernizr.custom.js"></script>
+</head>
+<body>
+  <div class="deck-container">
+
+    <!-- Признак -->
+
+    <section class="slide">
+        <h2>I. Bottlenecks</h2>
+    </section>
+
+    <section class="slide">
+        <h3>1. Медленный генсервер</h3>
+        <p>=> Неправильная архитектура</p>
+        <!--<p>Отсутвие хвостовой рекурсии (tail recursion) в длинном цикле</p>-->
+        <!-- Лучше просто использовать генсервер --!>
+        <ul>
+            <li>Single Responsibility Principle</li>
+            <!-- Один сервер делает слишком много -->
+
+            <li>Процесс на каждое параллельное событие</li>
+            <!-- В лишней конкурентности тоже нет смысла -->
+        </ul>
+    </section>
+
+    <section class="slide">
+        <h3>2. Генсервер, выполняющий синхронные операции к внешнему ресурсу</h3>
+        <pre>
+        handle_cast(msg, St = #st{redis = Redis}) ->
+            redis:qp(Redis, "GET key").
+            St.
+        </pre>
+        <p class="slide">=> Нужен пул медленного ресурса</p>
+
+    </section>
+
+    <section class="slide">
+        <h3>3. Несколько процессов использующих один медленный ресурс</h3>
+        <pre>
+        handle_cast(msg, St = #st{redis = Redis}) ->
+            spawn_link(fun() -> redis:qp(Redis, "GET key") end).
+            St.
+        </pre>
+        <img src="bottleneck_resource.png"/>
+        <p class="slide" style="font-size: 140%">Нужен пул медленных ресурсов</h2>
+    </section>
+
+    <section class="slide">
+      <h2>II. Дедлоки</h2>
+    </section>
+
+    <section class="slide">
+      <h3>1) Вызов gen_server самого себя</h3>
+      <h3>2) Взаимный синхронный вызов gen_server/gen_event</h3>
+
+      <p class="slide"><del>gen_server:call(Pid, message, infinity)</del></p>
+      <p class="slide">gen_server:call(Pid, message, 5000)</p>
+
+      <!-- <p>Лучше упасть, сразу будет понятно хотя бы в какую сторону рыть</p> -->
+    </section>
+
+    <section class="slide">
+        <h2>III. Проблемы копирования</h2>
+    </section>
+
+    <section class="slide">
+        <h3>Копирование данных между процессами</h3>
+        <ul>
+            <li>http://www.erlang.org/doc/efficiency_guide/processes.html</li>
+            <li>Refc binaries/Heap binaries</li>
+            <li>ets dets</li>
+        </ul>
+
+        <pre>
+        receiver_for_client(ServerPid, SystemId) ->
+            gen_server:call(ServerPid, {receiver_for_client, SystemId}).
+        </pre>
+
+        <!--Главный фейспалм-->
+        <!--Я по привычке думал, что поскольку данные в эрланге копируются по ссылке в пределах одного процесса, но-->
+        <!--то и между процессами в пределах одной виртуальной машины эрланга, они тоже будут копироваться по ссылке.-->
+        <!--Мы прочувствовали впервые это на репозитории кампаний-->
+        <!--В a2p у нас есть несколько кампаний, обладающих всякими разными данными,-->
+        <!--мы сделали модуль company_repository-->
+        <!--И для ускорения (чтобы репозиторий не был боттлнеком) вынесли работу с данными-->
+        <!--в паблик функции модуля (то есть код в них, всегда выполняется в контексте вызвавшего их процесса)-->
+        <!--В результате на каждый поход в репозиторий, мы копировали данные всех кампаний из процесса в процесс.-->
+        <!--А с учётом того, что падал при этом не company_repository, а происходило лавинообразные-->
+        <!--тормоза, потому что копились процессы, память росла, система залезала в своп-->
+        <!--мы далеко не сразу догадались, что не так.-->
+        <!--всё начинало лавинообразно тормозить.-->
+        <!--вывод: мы исходили из неверных предпосылок.-->
+        <!--И надо читать документацию-->
+        <!--Там всё было написано-->
+        <!--http://www.erlang.org/doc/efficiency_guide/processes.html-->
+        <!--Не копируются только бинарные данные большого объёма-->
+        <!--Refc binaries (не копируются между процессами в рамках одной-->
+        <!--виртуальной машины, у них собственный гарбадж коллектор на основе подсчёта ссылок на них)-->
+        <!--Heap binaries (<= 64 bytes)-->
+        <!--+ Что люди делают когда надо сделать быстрый кеш данных, которые будут читаться из разных-->
+        <!--процессов -> используют ets и dets-->
+        <!--Но конечно не для шаринга состояния между процессами-->
+
+        <!--Мотивация разработчиков, тут в том, что процесс в эрланге можно прозрачно вызывать на другой-->
+        <!--виртуальной машине.-->
+        <!--Ведь с философией let it crash процесс может в любой момент упасть.-->
+        <!--Данные процесса хранятся в локальном хипе треда.-->
+        <!--Что делать со ссылками на данные которых больше нет?-->
+        <!--Если копировать то всё упрощается + это вообще хорошо-->
+        <!--сочетается с функциональной парадигмой и позволяет избежать-->
+        <!--COPY ON WRITE-->
+    </section>
+
+    <section class="slide">
+        <h3>Копирование при замыканиях</h3>
+
+        <pre>
+        handle_call(all_sessions, _From, St) ->
+            spawn_link(fun() -> some_module:some_function(St) end).
+        </pre>
+
+        <!--Более сложный случай порождение порождение процесса с замыканием в которое попадает большая структура данных-->
+        <!--Обычный случай spawn_link в который попадает struct в генсервере-->
+
+        <!-- если данных много, например вы передаётся состояние ген сервера, которое принято хранить в одной структуре -->
+
+        <!--Решение-->
+        <!--1) Передавать в процесс только необходимые ему данные (что очень в рамках функционального стиля)-->
+        <!--2) Не делать по возможности спаун линк, а использовать другой gen_server с пулом воркеров к нему-->
+
+        <!--Но соблазн очень велик, потому что это удобно боттлнек можно убрать просто обернув кусок кода в спаун линк-->
+
+        <!--Вывод замыкания требуют внимания.-->
+    </section>
+
+    <section class="slide">
+        <h2>Решения</h2>
+        <p>1) Выполнять все операции внутри gen-server</p>
+        <p>1) Разделение состояния на независимые куски между ген серверами</p>
+        <p>2) Несколько генсерверов с идентичным состоянием и пул</p>
+
+        <!--3) Разделение состояния на несколько локальных-->
+        <!--Разделяем состояния между ген серверами, содержащими часть состояния-->
+        <!--то есть один gen_server на кампанию-->
+
+        <!--2) Разделение состояния на несколько генсерверов содержащих идентичное состояние-->
+        <!--Обращение к генсерверам через пул коннектов-->
+
+        <!--3) Разделение состояния на несколько локальных-->
+        <!--Разделяем состояния между ген серверами, содержащими часть состояния-->
+        <!--то есть один gen_server на кампанию-->
+    </section>
+
+    <section class="slide">
+        <h2>IV. Утечки памяти</h2>
+    </section>
+
+    <section class="slide">
+        <h4>1. Распухание gen сервера</h4>
+        <ul>
+            <li>Очередь на входе gen сервера</li>
+            <pre>erlang:process_info(Pid)</pre>
+        </ul>
+    </section>
+
+    <section class="slide">
+        <h4>2. Cast между разными нодами</h4>
+        <ul>
+            <li>Удалённая нода тормозит -></li>
+            <li>Очереди копятся -></li>
+            <li>Нода не отвечает -></li>
+            <li>Локальные очереди эрланга копятся -></li>
+            <li>Локальная нода тормозит</li>
+        </ul>
+        <p>Используем call или шину данных</p>
+    </section>
+
+    <section class="slide">
+      <h2>Излишний ввод/вывод</h2>
+      <!-- эрланг синхронная запись в файл -->
+      <p>Логи</p>
+      <!-- Логи не надо печатать в стдаут -->
+      <p class="slide">lager:error() => fsync</p>
+
+      <pre class="slide">
+      file:open(Path, [append, raw, {delayed_write, ?WRITE_BUFFER_SIZE, ?WRITE_BUFFER_MAX_DELAY}])
+      </pre>
+
+      <!--Работа с памятью это быстро любой ввод вывод это медленно-->
+      <!--a a2p логи отъедают у нас большую часть процессорного времени-->
+      <!--Интересна проблема с lager, у нас опять были непонятные тормоза-->
+      <!--Оказалось lager при вызове lager:error-->
+      <!--делает fsync-->
+      <!--А lager:error у нас местами вызывался очень часто-->
+      <!--больше мы его не вызываем-->
+    </section>
+
+    <section class="slide">
+        <h4>Недостаток ресурсов</h4>
+        <!--Нельзя залезать в свап, лучше упасть, чтобы процесс переподнялся супервайзером
+        если система в свопе то, понять, что происходит невозможно-->
+        <ul>
+            <li>ulimit -n</li>
+            <!--максимальное число доступных процессу файловых дескриптеров
+            мы ходим в редис через пулы и используем большое кол-во дескриптеров-->
+            <li>erl +P 1048576 (у нас в продакшене)</li>
+            <!-- мы используем кучу процессов -->
+            <!-- в эрланге не нужно бояться создания процесса и большого их кол-ва, например совершенно нормальная
+            ситуация, когда процессы используются для таймаутов
+        </ul>
+    </section>
+
+    <!-- Выводы: Использовать очереди -->
+
+    <!-- End slides. -->
+
+    <!-- Begin extension snippets. Add or remove as needed. -->
+
+    <!-- deck.navigation snippet -->
+    <div aria-role="Как передавать большие обЪёмы данных между процессами">
+      <a href="#" class="deck-prev-link" title="Previous">&#8592;</a>
+      <a href="#" class="deck-next-link" title="Next">&#8594;</a>
+    </div>
+
+    <!-- deck.status snippet -->
+    <p class="deck-status" aria-role="status">
+      <span class="deck-status-current"></span>
+      /
+      <span class="deck-status-total"></span>
+    </p>
+
+    <!-- deck.goto snippet -->
+    <form action="." method="get" class="goto-form">
+      <label for="goto-slide">Go to slide:</label>
+      <input type="text" name="slidenum" id="goto-slide" list="goto-datalist">
+      <datalist id="goto-datalist"></datalist>
+      <input type="submit" value="Go">
+    </form>
+
+    <!-- End extension snippets. -->
+  </div>
+
+<!-- Required JS files. -->
+<script src="jquery.min.js"></script>
+<script src="core/deck.core.js"></script>
+
+<!-- Extension JS files. Add or remove as needed. -->
+<script src="extensions/menu/deck.menu.js"></script>
+<script src="extensions/goto/deck.goto.js"></script>
+<script src="extensions/status/deck.status.js"></script>
+<script src="extensions/navigation/deck.navigation.js"></script>
+<script src="extensions/scale/deck.scale.js"></script>
+
+<!-- Initialize the deck. You can put this in an external file if desired. -->
+<script>
+  $(function() {
+    $.deck('.slide');
+  });
+</script>
+</body>
+</html>
